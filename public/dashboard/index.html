@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Automerge Repo Sync Server - Dashboard</title>
+    <link rel="preconnect" href="https://unpkg.com" />
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0b0d12;
+        --panel: #121723;
+        --text: #e7e9ee;
+        --muted: #9aa3b2;
+        --border: #2a3242;
+        --accent: #61dafb;
+        --accent-2: #0b5fff;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f7f9fc;
+          --panel: #ffffff;
+          --text: #1a2233;
+          --muted: #6b7280;
+          --border: #e6e8ee;
+          --accent: #0b5fff;
+          --accent-2: #7c3aed;
+        }
+      }
+
+      html, body { height: 100%; }
+      body {
+        margin: 0; padding: 2rem;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        background: linear-gradient(180deg, var(--bg), #0f1629 60%);
+        color: var(--text);
+      }
+      header { display:flex; align-items:baseline; gap:.75rem; margin-bottom: 1rem }
+      .muted { color: var(--muted) }
+      .row { display:flex; gap:1rem; flex-wrap: wrap; }
+      .card { padding: .8rem 1rem; border: 1px solid var(--border); border-radius: .6rem; background: var(--panel); min-width: 180px }
+      .stat .label { color: var(--muted); font-size: .85rem; margin-bottom: .25rem }
+      .stat .value { font-weight: 700; font-feature-settings: "tnum" on; }
+      .toolbar { margin: .75rem 0 1rem; }
+      .toolbar button { padding: .45rem .75rem; border-radius: .45rem; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer }
+      .toolbar button:hover { border-color: var(--accent) }
+      .toolbar a { color: var(--accent); text-decoration: none }
+
+      .docs { margin-top: 1rem }
+      .table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: .6rem; background: var(--panel) }
+      table { width: 100%; border-collapse: collapse; min-width: 640px; table-layout: auto }
+      th, td { text-align: left; padding: .6rem .8rem; border-bottom: 1px solid var(--border); vertical-align: top }
+      thead th { position: sticky; top: 0; background: var(--panel); color: var(--muted); font-weight: 600; }
+      tbody tr:hover { background: rgba(97,218,251,0.06) }
+      code { background: rgba(97,218,251,0.12); padding: .15rem .3rem; border-radius: .3rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      /* ID cell layout: ID text on the left, copy button on the right */
+      .id-wrap { display: flex; align-items: center; gap: .5rem; width: 100% }
+      .id-wrap .id { flex: 1 1 auto; display: block; max-width: 100%; white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere }
+      .copy-btn { flex: 0 0 auto; padding: .25rem .5rem; border-radius: .35rem; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; margin-left: auto; white-space: nowrap }
+      .copy-btn:hover { border-color: var(--accent) }
+      /* Give the ID column more space on larger screens */
+      @media (min-width: 900px) {
+        .table colgroup col.id { width: 60% }
+        .table colgroup col.size { width: 15% }
+        .table colgroup col.mtime { width: 25% }
+      }
+      a { color: var(--accent-2); text-decoration: none }
+    </style>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
