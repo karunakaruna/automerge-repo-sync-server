@@ -6,14 +6,21 @@ function useMetrics(intervalMs = 3000) {
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [authRequired, setAuthRequired] = useState(false)
 
   const load = async () => {
     try {
       setError(null)
-      const res = await fetch('/metrics.json', { cache: 'no-store' })
+      const res = await fetch('/metrics.json', { cache: 'no-store', credentials: 'same-origin' })
+      if (res.status === 401) {
+        setAuthRequired(true)
+        setData(null)
+        return
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const json = await res.json()
       setData(json)
+      setAuthRequired(false)
     } catch (e) {
       setError(e.message || String(e))
     } finally {
@@ -27,7 +34,7 @@ function useMetrics(intervalMs = 3000) {
     return () => clearInterval(timer)
   }, [intervalMs])
 
-  return { data, error, loading, reload: load }
+  return { data, error, loading, reload: load, authRequired, setAuthRequired }
 }
 
 const fmt = {
@@ -92,7 +99,56 @@ function DocsTable({ docs }) {
 }
 
 function App() {
-  const { data, error, loading, reload } = useMetrics(3000)
+  const { data, error, loading, reload, authRequired, setAuthRequired } = useMetrics(3000)
+  const [password, setPassword] = useState("")
+  const [authError, setAuthError] = useState("")
+
+  const login = async (e) => {
+    e?.preventDefault?.()
+    setAuthError("")
+    try {
+      const res = await fetch('/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ password })
+      })
+      if (!res.ok) {
+        setAuthError('Invalid password')
+        return
+      }
+      setPassword("")
+      setAuthRequired(false)
+      await reload()
+    } catch (err) {
+      setAuthError('Login failed')
+    }
+  }
+
+  const logout = async () => {
+    try { await fetch('/logout', { method: 'POST', credentials: 'same-origin' }) } catch {}
+    await reload()
+  }
+
+  if (authRequired) {
+    return (
+      window.React.createElement('div', { className: 'login-wrap' },
+        window.React.createElement('h1', null, 'Sync Server Login'),
+        window.React.createElement('form', { onSubmit: login, className: 'login-form' },
+          window.React.createElement('label', null, 'Password'),
+          window.React.createElement('input', {
+            type: 'password',
+            value: password,
+            onChange: (e) => setPassword(e.target.value),
+            placeholder: 'Enter password',
+            autoFocus: true
+          }),
+          window.React.createElement('button', { type: 'submit', disabled: !password }, 'Login'),
+        ),
+        authError ? window.React.createElement('p', { className: 'error' }, authError) : null,
+      )
+    )
+  }
   const docs = data?.documents
   return (
     window.React.createElement(window.React.Fragment, null,
@@ -112,6 +168,8 @@ function App() {
         window.React.createElement('a', { href: '/metrics.json', target: '_blank', rel: 'noreferrer' }, 'metrics.json'),
         ' · ',
         window.React.createElement('a', { href: '/', target: '_blank', rel: 'noreferrer' }, 'home'),
+        ' · ',
+        window.React.createElement('button', { onClick: () => logout(), title: 'Logout' }, 'Logout'),
       ),
       window.React.createElement('section', { className: 'docs' },
         window.React.createElement('h2', null, 'Documents'),

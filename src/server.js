@@ -45,6 +45,8 @@ export class Server {
 
     const PORT =
       process.env.PORT !== undefined ? parseInt(process.env.PORT) : 3030
+    const AUTH_TOKEN = process.env.AUTH_TOKEN ?? "motherearth"
+    const COOKIE_NAME = "amrg_auth"
     const app = express()
     // CORS for HTTP routes
     app.use((req, res, next) => {
@@ -60,6 +62,64 @@ export class Server {
       }
       next()
     })
+    // Body parsers for login API
+    app.use(express.json())
+    app.use(express.urlencoded({ extended: true }))
+
+    // Cookie parsing
+    const parseCookies = (cookieHeader = "") => {
+      /** @type {Record<string,string>} */
+      const out = {}
+      cookieHeader.split(";").forEach((p) => {
+        const i = p.indexOf("=")
+        if (i > -1) {
+          const k = p.slice(0, i).trim()
+          const v = p.slice(i + 1).trim()
+          out[k] = decodeURIComponent(v)
+        }
+      })
+      return out
+    }
+
+    // Simple auth helper for HTTP endpoints (cookie-based)
+    const requireAuth = (req, res, next) => {
+      if (!AUTH_TOKEN) return next()
+      const cookies = parseCookies(req.headers.cookie || "")
+      const token = cookies[COOKIE_NAME] || ""
+      if (token === AUTH_TOKEN) return next()
+      res.status(401).send("Unauthorized")
+    }
+
+    // Login/Logout endpoints
+    app.post("/login", (req, res) => {
+      const pwd = String(req.body?.password ?? req.body?.token ?? "")
+      if (!AUTH_TOKEN || pwd === AUTH_TOKEN) {
+        const attrs = [
+          `${COOKIE_NAME}=${encodeURIComponent(AUTH_TOKEN)}`,
+          "HttpOnly",
+          "Path=/",
+          "SameSite=Lax",
+        ]
+        // Only set Secure on HTTPS
+        if ((req.headers["x-forwarded-proto"] || req.protocol) === "https") {
+          attrs.push("Secure")
+        }
+        res.setHeader("Set-Cookie", attrs.join("; "))
+        res.json({ ok: true })
+        return
+      }
+      res.status(401).json({ ok: false, error: "invalid_password" })
+    })
+
+    app.post("/logout", (req, res) => {
+      res.setHeader(
+        "Set-Cookie",
+        `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+      )
+      res.json({ ok: true })
+    })
+
+    // Serve static files (dashboard must be accessible to show login form)
     app.use(express.static("public"))
 
     const config = {
@@ -77,12 +137,14 @@ export class Server {
       res.send(`👍 @automerge/automerge-repo-sync-server is running`)
     })
 
-    // Lightweight metrics API
-    app.get("/metrics.json", (req, res) => {
+    // Lightweight metrics API (protected)
+    app.get("/metrics.json", requireAuth, (req, res) => {
+      const addr = this.#server?.address?.() ?? null
+      const port = addr && typeof addr !== "string" ? addr.port : null
       res.json({
         status: "ok",
         hostname: this.#hostname,
-        port: this.#server.address().port,
+        port,
         dataDir: this.#dataDir,
         activeConnections: this.#clients.size,
         documents: this.#listDocuments(),
@@ -101,6 +163,29 @@ export class Server {
     })
 
     this.#server.on("upgrade", (request, socket, head) => {
+      // Cookie-based auth for WebSocket upgrade
+      try {
+        const cookies = parseCookies(request.headers["cookie"] || "")
+        const token = cookies[COOKIE_NAME] || ""
+        if (AUTH_TOKEN && token !== AUTH_TOKEN) {
+          socket.write(
+            "HTTP/1.1 401 Unauthorized\r\n" +
+              "Connection: close\r\n" +
+              "Content-Type: text/plain\r\n\r\nUnauthorized"
+          )
+          socket.destroy()
+          return
+        }
+      } catch {
+        try {
+          socket.write(
+            "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
+          )
+        } catch {}
+        socket.destroy()
+        return
+      }
+
       this.#socket.handleUpgrade(request, socket, head, (socket) => {
         this.#socket.emit("connection", socket, request)
       })
