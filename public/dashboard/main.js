@@ -60,7 +60,7 @@ function Stat({ label, children }) {
   )
 }
 
-function DocsTable({ docs }) {
+function DocsTable({ docs, onChanged }) {
   if (!docs || docs.length === 0) return window.React.createElement('p', { className: 'muted' }, 'No documents found.')
   const rows = docs.slice().sort((a,b)=> b.mtimeMs - a.mtimeMs)
   return (
@@ -78,14 +78,62 @@ function DocsTable({ docs }) {
             window.React.createElement('tr', { key: doc.id },
               window.React.createElement('td', null,
                 window.React.createElement('div', { className: 'id-wrap' },
-                  window.React.createElement('code', { className: 'id' }, doc.id),
+                  window.React.createElement('code', { className: 'id' }, `${doc.protected ? '🔒 ' : ''}${doc.id}`),
                   window.React.createElement('button', {
                     className: 'copy-btn',
                     title: 'Copy ID',
                     onClick: async (e) => {
                       try { await navigator.clipboard.writeText(doc.id) } catch {}
                     }
-                  }, 'Copy')
+                  }, 'Copy'),
+                  // Protect button
+                  window.React.createElement('button', {
+                    className: 'copy-btn',
+                    title: doc.protected ? 'Change protection password' : 'Protect document',
+                    onClick: async () => {
+                      const pwd = prompt(doc.protected ? 'Set a new password for this document' : 'Set a password to protect this document')
+                      if (!pwd) return
+                      try {
+                        const res = await fetch(`/docs/${encodeURIComponent(doc.id)}/protect`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          credentials: 'same-origin',
+                          body: JSON.stringify({ password: pwd })
+                        })
+                        if (!res.ok) {
+                          alert('Failed to protect document')
+                          return
+                        }
+                        onChanged?.()
+                      } catch {
+                        alert('Failed to protect document')
+                      }
+                    }
+                  }, doc.protected ? 'Change password' : 'Protect'),
+                  // Login to edit button
+                  window.React.createElement('button', {
+                    className: 'copy-btn',
+                    title: 'Login to edit this document',
+                    onClick: async () => {
+                      const pwd = prompt('Enter document password to enable edits for this browser session')
+                      if (!pwd) return
+                      try {
+                        const res = await fetch(`/docs/${encodeURIComponent(doc.id)}/login`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          credentials: 'same-origin',
+                          body: JSON.stringify({ password: pwd })
+                        })
+                        if (!res.ok) {
+                          alert('Invalid password or doc not protected')
+                          return
+                        }
+                        alert('Edit access granted for this document')
+                      } catch {
+                        alert('Login failed')
+                      }
+                    }
+                  }, 'Login to edit')
                 )
               ),
               window.React.createElement('td', null, fmt.bytes(doc.sizeBytes)),
@@ -173,7 +221,7 @@ function App() {
       ),
       window.React.createElement('section', { className: 'docs' },
         window.React.createElement('h2', null, 'Documents'),
-        window.React.createElement(DocsTable, { docs })
+        window.React.createElement(DocsTable, { docs, onChanged: reload })
       )
     )
   )

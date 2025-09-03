@@ -6,6 +6,7 @@ import { Repo } from "@automerge/automerge-repo"
 import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket"
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs"
 import os from "os"
+import crypto from "crypto"
 
 export class Server {
   /** @type WebSocketServer */
@@ -43,14 +44,55 @@ export class Server {
 
     this.#socket = new WebSocketServer({ noServer: true })
 
+    // Global resilience: don't crash on transient network timeouts or promise rejections
+    const errMsg = (e) => {
+      try {
+        if (e && typeof e === "object" && "message" in e) return String(e.message)
+        return String(e)
+      } catch {
+        return "(unknown error)"
+      }
+    }
+    try {
+      process.on("unhandledRejection", (err) => {
+        const msg = errMsg(err)
+        if (msg.includes("withTimeout")) {
+          console.warn("[warn] Ignoring network timeout:", msg)
+        } else {
+          console.error("[unhandledRejection]", err)
+        }
+      })
+      process.on("uncaughtException", (err) => {
+        const msg = errMsg(err)
+        if (msg.includes("withTimeout")) {
+          console.warn("[warn] Ignoring network timeout (uncaught):", msg)
+        } else {
+          console.error("[uncaughtException]", err)
+        }
+      })
+    } catch {}
+
     const PORT =
       process.env.PORT !== undefined ? parseInt(process.env.PORT) : 3030
     const AUTH_TOKEN = process.env.AUTH_TOKEN ?? "motherearth"
+    const DOC_TOKEN_TTL_SECONDS = process.env.DOC_TOKEN_TTL_SECONDS
+      ? Number(process.env.DOC_TOKEN_TTL_SECONDS)
+      : 24 * 60 * 60
+    const ACL_PATH = `${this.#dataDir}/.acl.json`
     const COOKIE_NAME = "amrg_auth"
     const app = express()
-    // CORS for HTTP routes
+    // CORS for HTTP routes (allow Vite dev and preview origins)
     app.use((req, res, next) => {
-      res.header("Access-Control-Allow-Origin", "http://localhost:8000")
+      const origin = req.headers.origin
+      const allowlist = new Set([
+        "http://localhost:5173", // Vite dev
+        "http://localhost:8000", // alternate dev/preview
+      ])
+      if (origin && allowlist.has(origin)) {
+        res.header("Access-Control-Allow-Origin", origin)
+        res.header("Vary", "Origin")
+        res.header("Access-Control-Allow-Credentials", "true")
+      }
       res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
       res.header(
         "Access-Control-Allow-Headers",
@@ -90,6 +132,49 @@ export class Server {
       res.status(401).send("Unauthorized")
     }
 
+    // --- ACL helpers (per-document write protection) ---
+    /**
+     * @returns {Record<string, { hash: string }>} docId -> { hash }
+     */
+    const loadACL = () => {
+      try {
+        const raw = fs.readFileSync(ACL_PATH, "utf8")
+        const json = JSON.parse(raw)
+        if (json && typeof json === "object") return json
+      } catch {}
+      return {}
+    }
+    /** @param {Record<string, { hash: string }>} acl */
+    const saveACL = (acl) => {
+      try {
+        fs.writeFileSync(ACL_PATH, JSON.stringify(acl, null, 2))
+      } catch {}
+    }
+    const hmac = (msg) =>
+      crypto.createHmac("sha256", AUTH_TOKEN || "amrg_secret").update(msg).digest("hex")
+    /** Hash a password for storage (HMAC; for stronger security, replace with scrypt/bcrypt) */
+    const hashPassword = (pwd) => hmac(`pwd:${pwd}`)
+    /** Verify provided password against stored hash */
+    const verifyPassword = (pwd, hash) => hashPassword(pwd) === hash
+    /** Sign a short payload for doc cookies */
+    const signToken = (payload) => {
+      const data = Buffer.from(JSON.stringify(payload)).toString("base64url")
+      const sig = hmac(data)
+      return `${data}.${sig}`
+    }
+    const verifyToken = (token) => {
+      try {
+        const [data, sig] = String(token).split(".")
+        if (!data || !sig) return null
+        if (hmac(data) !== sig) return null
+        const payload = JSON.parse(Buffer.from(data, "base64url").toString("utf8"))
+        if (payload.exp && Date.now() > payload.exp) return null
+        return payload
+      } catch {
+        return null
+      }
+    }
+
     // Login/Logout endpoints
     app.post("/login", (req, res) => {
       const pwd = String(req.body?.password ?? req.body?.token ?? "")
@@ -119,6 +204,70 @@ export class Server {
       res.json({ ok: true })
     })
 
+    // Per-document: set/replace protection password (admin-only)
+    app.post("/docs/:docId/protect", requireAuth, (req, res) => {
+      const docId = String(req.params.docId)
+      const pwd = String(req.body?.password ?? "")
+      if (!docId) return res.status(400).json({ ok: false, error: "missing_docId" })
+      if (!pwd) return res.status(400).json({ ok: false, error: "missing_password" })
+      const acl = loadACL()
+      acl[docId] = { hash: hashPassword(pwd) }
+      try { fs.mkdirSync(this.#dataDir, { recursive: true }) } catch {}
+      try { fs.writeFileSync(`${this.#dataDir}/.acl.json`, JSON.stringify(acl, null, 2)) } catch {}
+      res.json({ ok: true })
+    })
+
+    // Per-document: contributor login to obtain a doc-scoped cookie
+    app.post("/docs/:docId/login", (req, res) => {
+      const docId = String(req.params.docId)
+      const pwd = String(req.body?.password ?? req.body?.token ?? "")
+      if (!docId) return res.status(400).json({ ok: false, error: "missing_docId" })
+      const acl = loadACL()
+      const entry = acl[docId]
+      if (!entry) return res.status(404).json({ ok: false, error: "not_protected" })
+      if (!verifyPassword(pwd, entry.hash)) {
+        return res.status(401).json({ ok: false, error: "invalid_password" })
+      }
+      const exp = Date.now() + DOC_TOKEN_TTL_SECONDS * 1000
+      const token = signToken({ d: docId, exp })
+      const cookieName = `amrg_doc_${docId}`
+      const attrs = [
+        `${cookieName}=${encodeURIComponent(token)}`,
+        "HttpOnly",
+        "Path=/",
+        "SameSite=Lax",
+        `Max-Age=${DOC_TOKEN_TTL_SECONDS}`,
+      ]
+      if (req.headers["x-forwarded-proto"] === "https" || req.protocol === "https") {
+        attrs.push("Secure")
+      }
+      res.setHeader("Set-Cookie", attrs.join("; "))
+      res.json({ ok: true, exp })
+    })
+
+    // Clear per-doc cookie to remove write permissions for this browser
+    app.post("/docs/:docId/logout", (req, res) => {
+      const docId = String(req.params.docId)
+      const cookieName = `amrg_doc_${docId}`
+      res.setHeader(
+        "Set-Cookie",
+        `${cookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+      )
+      res.json({ ok: true })
+    })
+
+    // Public status endpoint: tells if a document is protected and if caller has write cookie
+    app.get("/docs/:docId/status", (req, res) => {
+      const docId = String(req.params.docId)
+      const acl = loadACL()
+      const isProtected = Boolean(acl[docId])
+      const cookies = parseCookies(req.headers.cookie || "")
+      const tok = cookies[`amrg_doc_${docId}`]
+      const payload = tok ? verifyToken(tok) : null
+      const canWrite = Boolean(payload && payload.d === docId)
+      res.json({ ok: true, protected: isProtected, canWrite })
+    })
+
     // Serve static files (dashboard must be accessible to show login form)
     app.use(express.static("public"))
 
@@ -139,6 +288,7 @@ export class Server {
 
     // Lightweight metrics API (protected)
     app.get("/metrics.json", requireAuth, (req, res) => {
+      const acl = loadACL()
       const addr = this.#server?.address?.() ?? null
       const port = addr && typeof addr !== "string" ? addr.port : null
       res.json({
@@ -147,7 +297,7 @@ export class Server {
         port,
         dataDir: this.#dataDir,
         activeConnections: this.#clients.size,
-        documents: this.#listDocuments(),
+        documents: this.#listDocuments().map((d) => ({ ...d, protected: Boolean(acl[d.id]) })),
       })
     })
 
@@ -187,6 +337,11 @@ export class Server {
       }
 
       this.#socket.handleUpgrade(request, socket, head, (socket) => {
+        // Stash parsed cookies for later per-document checks
+        try {
+          // @ts-ignore
+          socket.__cookies = parseCookies(request.headers["cookie"] || "")
+        } catch {}
         this.#socket.emit("connection", socket, request)
       })
     })
@@ -194,6 +349,48 @@ export class Server {
     // Track active WS connections
     this.#socket.on("connection", (socket) => {
       this.#clients.add(socket)
+
+      // Conservative per-doc gate: if a message payload contains a protected docId
+      // and the socket lacks a valid doc cookie, close with policy violation.
+      // Note: This is a heuristic string scan suitable for current adapters.
+      socket.on("message", (data) => {
+        try {
+          const acl = loadACL()
+          const protectedIds = Object.keys(acl)
+          if (protectedIds.length === 0) return
+          let buf
+          if (typeof data === "string") {
+            buf = Buffer.from(data)
+          } else if (Buffer.isBuffer(data)) {
+            buf = data
+          } else if (data instanceof ArrayBuffer) {
+            buf = Buffer.from(new Uint8Array(data))
+          } else if (Array.isArray(data)) {
+            // Array of Buffer (from ws in some cases)
+            buf = Buffer.concat(data.map((b) => (Buffer.isBuffer(b) ? b : Buffer.from(b))))
+          } else {
+            // Fallback
+            buf = Buffer.from(String(data ?? ""))
+          }
+          // @ts-ignore
+          const cookies = socket.__cookies || {}
+          for (const docId of protectedIds) {
+            // Cheap substring scan for docId within frame
+            if (buf.includes(Buffer.from(docId))) {
+              const cookieName = `amrg_doc_${docId}`
+              const tok = cookies[cookieName]
+              const payload = tok ? verifyToken(tok) : null
+              if (!payload || payload.d !== docId) {
+                try { socket.close(1008, "Write to protected document not authorized") } catch {}
+                // Ensure the connection is torn down promptly to avoid dangling waits in the adapter
+                try { setTimeout(() => { try { socket.terminate() } catch {} }, 200) } catch {}
+                return
+              }
+            }
+          }
+        } catch {}
+      })
+
       socket.on("close", () => this.#clients.delete(socket))
     })
   }
@@ -220,8 +417,12 @@ export class Server {
    */
   #listDocuments() {
     try {
-      /** @type {{ id: string, type: 'dir'|'file', sizeBytes: number, mtimeMs: number, mtimeISO: string }[]} */
-      const out = []
+      /**
+       * We'll collapse adapter artifacts like `<docId>snapshot` and `<docId>sync-state`
+        * into a single logical `docId` row. We also hide the ACL file.
+       */
+      /** @type {Record<string, { id: string, type: 'dir'|'file', sizeBytes: number, mtimeMs: number }>} */
+      const byId = {}
 
       /**
        * Recursively walk the storage dir. Many adapters shard IDs across
@@ -245,13 +446,10 @@ export class Server {
         if (files.length > 0 || subdirs.length === 0) {
           const id = segments.join("") || dir.replace(this.#dataDir + "/", "")
           const { size, mtime } = this.#subtreeStats(dir)
-          out.push({
-            id,
-            type: "dir",
-            sizeBytes: size,
-            mtimeMs: mtime,
-            mtimeISO: new Date(mtime).toISOString(),
-          })
+          const prev = byId[id]
+          const sizeBytes = Math.max(prev?.sizeBytes || 0, size)
+          const mtimeMs = Math.max(prev?.mtimeMs || 0, mtime)
+          byId[id] = { id, type: "dir", sizeBytes, mtimeMs }
           return
         }
 
@@ -275,17 +473,26 @@ export class Server {
         } else if (e.isFile()) {
           try {
             const stat = fs.statSync(p)
-            out.push({
-              id: e.name,
-              type: "file",
-              sizeBytes: stat.size,
-              mtimeMs: stat.mtimeMs,
-              mtimeISO: new Date(stat.mtimeMs).toISOString(),
-            })
+            if (e.name === ".acl.json") continue
+            // Collapse known suffixes
+            let baseId = e.name
+            if (baseId.endsWith("snapshot")) baseId = baseId.slice(0, -"snapshot".length)
+            if (baseId.endsWith("sync-state")) baseId = baseId.slice(0, -"sync-state".length)
+            const prev = byId[baseId]
+            const sizeBytes = (prev?.sizeBytes || 0) + stat.size
+            const mtimeMs = Math.max(prev?.mtimeMs || 0, stat.mtimeMs)
+            byId[baseId] = { id: baseId, type: "file", sizeBytes, mtimeMs }
           } catch {}
         }
       }
-      return out
+      // Convert to array with ISO dates
+      return Object.values(byId).map((d) => ({
+        id: d.id,
+        type: d.type,
+        sizeBytes: d.sizeBytes,
+        mtimeMs: d.mtimeMs,
+        mtimeISO: new Date(d.mtimeMs).toISOString(),
+      }))
     } catch {
       return []
     }
