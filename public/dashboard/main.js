@@ -69,6 +69,7 @@ function DocsTable({ docs, onChanged }) {
         window.React.createElement('thead', null,
           window.React.createElement('tr', null,
             window.React.createElement('th', null, 'Document ID'),
+            window.React.createElement('th', null, 'Label'),
             window.React.createElement('th', null, 'Size'),
             window.React.createElement('th', null, 'Last Modified'),
           ),
@@ -134,6 +135,35 @@ function DocsTable({ docs, onChanged }) {
                       }
                     }
                   }, 'Login to edit')
+                )
+              ),
+              // Human-readable label column
+              window.React.createElement('td', null,
+                window.React.createElement('div', { className: 'id-wrap' },
+                  window.React.createElement('span', { className: 'muted' }, doc.label || '—'),
+                  window.React.createElement('button', {
+                    className: 'copy-btn',
+                    title: 'Edit label',
+                    onClick: async () => {
+                      const next = prompt('Label for this document', doc.label || '')
+                      if (next === null) return
+                      try {
+                        const res = await fetch(`/docs/${encodeURIComponent(doc.id)}/label`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          credentials: 'same-origin',
+                          body: JSON.stringify({ label: next })
+                        })
+                        if (!res.ok) {
+                          alert('Failed to update label')
+                          return
+                        }
+                        onChanged?.()
+                      } catch {
+                        alert('Failed to update label')
+                      }
+                    }
+                  }, 'Edit label')
                 )
               ),
               window.React.createElement('td', null, fmt.bytes(doc.sizeBytes)),

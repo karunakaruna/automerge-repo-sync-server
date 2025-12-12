@@ -74,18 +74,20 @@ export class Server {
 
     const PORT =
       process.env.PORT !== undefined ? parseInt(process.env.PORT) : 3030
-    const AUTH_TOKEN = process.env.AUTH_TOKEN ?? "motherearth"
+    const AUTH_TOKEN = process.env.AUTH_TOKEN ?? ""
     const DOC_TOKEN_TTL_SECONDS = process.env.DOC_TOKEN_TTL_SECONDS
       ? Number(process.env.DOC_TOKEN_TTL_SECONDS)
       : 24 * 60 * 60
     const ACL_PATH = `${this.#dataDir}/.acl.json`
+    const LABELS_PATH = `${this.#dataDir}/.labels.json`
     const COOKIE_NAME = "amrg_auth"
     const app = express()
     // CORS for HTTP routes (allow Vite dev and preview origins)
     app.use((req, res, next) => {
       const origin = req.headers.origin
       const allowlist = new Set([
-        "http://localhost:5173", // Vite dev
+        "http://localhost:5173", // Vite dev (viewer / quickstart default)
+        "http://localhost:5174", // alternate dev port (quickstart when 5173 taken)
         "http://localhost:8000", // alternate dev/preview
       ])
       if (origin && allowlist.has(origin)) {
@@ -150,6 +152,23 @@ export class Server {
         fs.writeFileSync(ACL_PATH, JSON.stringify(acl, null, 2))
       } catch {}
     }
+    // --- Simple per-document labels for dashboard readability ---
+    /** @returns {Record<string, { label: string }>} docId -> { label } */
+    const loadLabels = () => {
+      try {
+        const raw = fs.readFileSync(LABELS_PATH, "utf8")
+        const json = JSON.parse(raw)
+        if (json && typeof json === "object") return json
+      } catch {}
+      return {}
+    }
+    /** @param {Record<string, { label: string }>} labels */
+    const saveLabels = (labels) => {
+      try {
+        fs.writeFileSync(LABELS_PATH, JSON.stringify(labels, null, 2))
+      } catch {}
+    }
+
     const hmac = (msg) =>
       crypto.createHmac("sha256", AUTH_TOKEN || "amrg_secret").update(msg).digest("hex")
     /** Hash a password for storage (HMAC; for stronger security, replace with scrypt/bcrypt) */
@@ -268,6 +287,21 @@ export class Server {
       res.json({ ok: true, protected: isProtected, canWrite })
     })
 
+    // Per-document: set or clear a human-readable label (admin-only)
+    app.post("/docs/:docId/label", requireAuth, (req, res) => {
+      const docId = String(req.params.docId)
+      if (!docId) return res.status(400).json({ ok: false, error: "missing_docId" })
+      const label = typeof req.body?.label === "string" ? req.body.label.trim() : ""
+      const labels = loadLabels()
+      if (label) {
+        labels[docId] = { label }
+      } else {
+        delete labels[docId]
+      }
+      saveLabels(labels)
+      res.json({ ok: true })
+    })
+
     // Serve static files (dashboard must be accessible to show login form)
     app.use(express.static("public"))
 
@@ -289,6 +323,7 @@ export class Server {
     // Lightweight metrics API (protected)
     app.get("/metrics.json", requireAuth, (req, res) => {
       const acl = loadACL()
+      const labels = loadLabels()
       const addr = this.#server?.address?.() ?? null
       const port = addr && typeof addr !== "string" ? addr.port : null
       res.json({
@@ -297,7 +332,11 @@ export class Server {
         port,
         dataDir: this.#dataDir,
         activeConnections: this.#clients.size,
-        documents: this.#listDocuments().map((d) => ({ ...d, protected: Boolean(acl[d.id]) })),
+        documents: this.#listDocuments().map((d) => ({
+          ...d,
+          protected: Boolean(acl[d.id]),
+          label: labels[d.id]?.label || "",
+        })),
       })
     })
 
