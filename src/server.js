@@ -80,7 +80,11 @@ export class Server {
       : 24 * 60 * 60
     const ACL_PATH = `${this.#dataDir}/.acl.json`
     const LABELS_PATH = `${this.#dataDir}/.labels.json`
+    const OWNERS_PATH = `${this.#dataDir}/.owners.json`
+    const LOCKS_PATH = `${this.#dataDir}/.locks.json`
+    const USERS_PATH = `${this.#dataDir}/.users.json`
     const COOKIE_NAME = "amrg_auth"
+    const USER_COOKIE_NAME = "amrg_user"
     const app = express()
     // CORS for HTTP routes (allow Vite dev and preview origins)
     app.use((req, res, next) => {
@@ -126,6 +130,7 @@ export class Server {
     }
 
     // Simple auth helper for HTTP endpoints (cookie-based)
+    /** @param {import('express').Request} req @param {import('express').Response} res @param {import('express').NextFunction} next */
     const requireAuth = (req, res, next) => {
       if (!AUTH_TOKEN) return next()
       const cookies = parseCookies(req.headers.cookie || "")
@@ -169,18 +174,97 @@ export class Server {
       } catch {}
     }
 
+    /** @returns {Record<string, { ownerId: string }>} docId -> { ownerId } */
+    const loadOwners = () => {
+      try {
+        const raw = fs.readFileSync(OWNERS_PATH, "utf8")
+        const json = JSON.parse(raw)
+        if (json && typeof json === "object") return json
+      } catch {}
+      return {}
+    }
+    /** @param {Record<string, { ownerId: string }>} owners */
+    const saveOwners = (owners) => {
+      try {
+        fs.writeFileSync(OWNERS_PATH, JSON.stringify(owners, null, 2))
+      } catch {}
+    }
+
+    /** @returns {Record<string, { locked: boolean }>} docId -> { locked } */
+    const loadLocks = () => {
+      try {
+        const raw = fs.readFileSync(LOCKS_PATH, "utf8")
+        const json = JSON.parse(raw)
+        if (json && typeof json === "object") return json
+      } catch {}
+      return {}
+    }
+    /** @param {Record<string, { locked: boolean }>} locks */
+    const saveLocks = (locks) => {
+      try {
+        fs.writeFileSync(LOCKS_PATH, JSON.stringify(locks, null, 2))
+      } catch {}
+    }
+
+    /** @returns {Record<string, { userId: string }>} keyHash -> { userId } */
+    const loadUsers = () => {
+      try {
+        const raw = fs.readFileSync(USERS_PATH, "utf8")
+        const json = JSON.parse(raw)
+        if (json && typeof json === "object") return json
+      } catch {}
+      return {}
+    }
+    /** @param {Record<string, { userId: string }>} users */
+    const saveUsers = (users) => {
+      try {
+        fs.writeFileSync(USERS_PATH, JSON.stringify(users, null, 2))
+      } catch {}
+    }
+
+    const genShortUserId = () => {
+      const part = () => Math.random().toString(36).slice(2, 8)
+      return `${part()}-${part()}`
+    }
+
+    /** @param {string} userKey */
+    const hashUserKey = (userKey) => {
+      // Do not store raw private keys on disk.
+      return crypto.createHash("sha256").update(String(userKey)).digest("hex")
+    }
+
+    /** @param {import('express').Request} req */
+    const getUserIdFromReq = (req) => {
+      try {
+        const cookies = parseCookies(req.headers.cookie || "")
+        const v = cookies[USER_COOKIE_NAME]
+        return v ? String(v) : ""
+      } catch {
+        return ""
+      }
+    }
+
+    /** @param {string} msg */
     const hmac = (msg) =>
       crypto.createHmac("sha256", AUTH_TOKEN || "amrg_secret").update(msg).digest("hex")
-    /** Hash a password for storage (HMAC; for stronger security, replace with scrypt/bcrypt) */
+    /** Hash a password for storage (HMAC; for stronger security, replace with scrypt/bcrypt)
+     * @param {string} pwd
+     */
     const hashPassword = (pwd) => hmac(`pwd:${pwd}`)
-    /** Verify provided password against stored hash */
+    /** Verify provided password against stored hash
+     * @param {string} pwd
+     * @param {string} hash
+     */
     const verifyPassword = (pwd, hash) => hashPassword(pwd) === hash
-    /** Sign a short payload for doc cookies */
+    /** Sign a short payload for doc cookies
+     * @param {any} payload
+     */
     const signToken = (payload) => {
       const data = Buffer.from(JSON.stringify(payload)).toString("base64url")
       const sig = hmac(data)
       return `${data}.${sig}`
     }
+    /** @param {string} token */
     const verifyToken = (token) => {
       try {
         const [data, sig] = String(token).split(".")
@@ -221,6 +305,69 @@ export class Server {
         `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
       )
       res.json({ ok: true })
+    })
+
+    // Identity: embody via long private userKey -> stable short userId cookie.
+    // Legacy: if { userId } is provided without { userKey }, treat it as the cookie value.
+    app.post("/users/embody", (req, res) => {
+      const userKey = String(req.body?.userKey ?? req.body?.key ?? "").trim()
+      const legacyUserId = String(req.body?.userId ?? "").trim()
+
+      /** @type {string} */
+      let userId = ""
+
+      if (userKey) {
+        const keyHash = hashUserKey(userKey)
+        const users = loadUsers()
+        const existing = users[keyHash]?.userId
+        userId = existing ? String(existing) : genShortUserId()
+        users[keyHash] = { userId }
+        try {
+          fs.mkdirSync(this.#dataDir, { recursive: true })
+        } catch {}
+        saveUsers(users)
+      } else if (legacyUserId) {
+        userId = legacyUserId
+      } else {
+        return res.status(400).json({ ok: false, error: "missing_userKey" })
+      }
+
+      const attrs = [
+        `${USER_COOKIE_NAME}=${encodeURIComponent(userId)}`,
+        "Path=/",
+        "SameSite=Lax",
+      ]
+      if ((req.headers["x-forwarded-proto"] || req.protocol) === "https") {
+        attrs.push("Secure")
+      }
+      res.setHeader("Set-Cookie", attrs.join("; "))
+      res.json({ ok: true, userId })
+    })
+
+    app.get("/users/me", (req, res) => {
+      const userId = getUserIdFromReq(req)
+      res.json({ ok: true, userId: userId || null })
+    })
+
+    app.get("/users/me/docs", (req, res) => {
+      const userId = getUserIdFromReq(req)
+      if (!userId) return res.json({ ok: true, userId: null, docs: [] })
+      const owners = loadOwners()
+      const docs = Object.entries(owners)
+        .filter(([, v]) => v && v.ownerId === userId)
+        .map(([docId]) => docId)
+      res.json({ ok: true, userId, docs })
+    })
+
+    // Public: return current ownership map (docId -> ownerId)
+    app.get("/meta/owners", (req, res) => {
+      const owners = loadOwners()
+      /** @type {Record<string, string>} */
+      const out = {}
+      for (const [docId, v] of Object.entries(owners)) {
+        if (v && typeof v.ownerId === "string" && v.ownerId) out[docId] = v.ownerId
+      }
+      res.json({ ok: true, owners: out })
     })
 
     // Per-document: set/replace protection password (admin-only)
@@ -284,7 +431,92 @@ export class Server {
       const tok = cookies[`amrg_doc_${docId}`]
       const payload = tok ? verifyToken(tok) : null
       const canWrite = Boolean(payload && payload.d === docId)
-      res.json({ ok: true, protected: isProtected, canWrite })
+      const owners = loadOwners()
+      const ownerId = owners[docId]?.ownerId || null
+      const userId = getUserIdFromReq(req) || null
+      const locks = loadLocks()
+      const locked = locks[docId] ? Boolean(locks[docId].locked) : false
+      res.json({ ok: true, protected: isProtected, canWrite, ownerId, userId, locked })
+    })
+
+    // Owner-only: toggle comment lock (CanvasDoc.locked)
+    app.post("/docs/:docId/lock", async (req, res) => {
+      try {
+        const docId = String(req.params.docId)
+        const userId = getUserIdFromReq(req)
+        if (!userId) return res.status(401).json({ ok: false, error: "not_embodied" })
+
+        const owners = loadOwners()
+        const ownerId = owners[docId]?.ownerId || ""
+        if (!ownerId || ownerId !== userId) {
+          return res.status(403).json({ ok: false, error: "not_owner", ownerId: ownerId || null })
+        }
+
+        const locked = Boolean(req.body?.locked)
+        const locks = loadLocks()
+        locks[docId] = { locked }
+        try { fs.mkdirSync(this.#dataDir, { recursive: true }) } catch {}
+        saveLocks(locks)
+        res.json({ ok: true, docId, locked })
+      } catch (e) {
+        res.status(500).json({ ok: false, error: "lock_failed" })
+      }
+    })
+
+    // Public: batch flags for many docs (for canvas list UI)
+    app.post("/meta/docs/flags", async (req, res) => {
+      try {
+        const docIds = Array.isArray(req.body?.docIds)
+          ? req.body.docIds.map((/** @type {any} */ d) => String(d))
+          : []
+        const owners = loadOwners()
+        const acl = loadACL()
+        const locks = loadLocks()
+        /** @type {Record<string, { ownerId: string | null, protected: boolean, locked: boolean | null }>} */
+        const out = {}
+        for (const docId of docIds) {
+          const locked = locks[docId] ? Boolean(locks[docId].locked) : false
+          out[docId] = {
+            ownerId: owners[docId]?.ownerId || null,
+            protected: Boolean(acl[docId]),
+            locked,
+          }
+        }
+        res.json({ ok: true, flags: out })
+      } catch {
+        res.status(500).json({ ok: false, error: "flags_failed" })
+      }
+    })
+
+    // Claim/unclaim ownership for a doc (requires a userId cookie)
+    app.post("/docs/:docId/claim", (req, res) => {
+      const docId = String(req.params.docId)
+      const userId = getUserIdFromReq(req)
+      if (!userId) return res.status(401).json({ ok: false, error: "not_embodied" })
+      const owners = loadOwners()
+      const existing = owners[docId]?.ownerId || ""
+      if (existing && existing !== userId) {
+        return res.status(409).json({ ok: false, error: "already_claimed", ownerId: existing })
+      }
+      owners[docId] = { ownerId: userId }
+      try { fs.mkdirSync(this.#dataDir, { recursive: true }) } catch {}
+      saveOwners(owners)
+      res.json({ ok: true, docId, ownerId: userId })
+    })
+
+    app.post("/docs/:docId/unclaim", (req, res) => {
+      const docId = String(req.params.docId)
+      const userId = getUserIdFromReq(req)
+      if (!userId) return res.status(401).json({ ok: false, error: "not_embodied" })
+      const owners = loadOwners()
+      const existing = owners[docId]?.ownerId || ""
+      if (!existing) return res.json({ ok: true, docId, ownerId: null })
+      if (existing !== userId) {
+        return res.status(403).json({ ok: false, error: "not_owner", ownerId: existing })
+      }
+      delete owners[docId]
+      saveOwners(owners)
+      res.json({ ok: true, docId, ownerId: null })
     })
 
     // Per-document: set or clear a human-readable label (admin-only)
@@ -338,6 +570,25 @@ export class Server {
           label: labels[d.id]?.label || "",
         })),
       })
+    })
+
+    // Fetch document contents (for canvas navigator)
+    app.get("/docs/:docId", async (req, res) => {
+      try {
+        const docId = String(req.params.docId)
+        const url = docId.startsWith("automerge:") ? docId : `automerge:${docId}`
+        const handle = await this.#repo.find(url)
+        await handle.whenReady()
+        const doc = await handle.doc()
+        if (!doc) {
+          res.status(404).json({ error: "Document not found" })
+          return
+        }
+        res.json(doc)
+      } catch (e) {
+        console.error("Failed to fetch document", e)
+        res.status(500).json({ error: "Failed to fetch document" })
+      }
     })
 
     // Redirect to the static React dashboard app under public/dashboard/
@@ -406,7 +657,9 @@ export class Server {
             buf = Buffer.from(new Uint8Array(data))
           } else if (Array.isArray(data)) {
             // Array of Buffer (from ws in some cases)
-            buf = Buffer.concat(data.map((b) => (Buffer.isBuffer(b) ? b : Buffer.from(b))))
+            const parts = data.map((b) => (Buffer.isBuffer(b) ? b : Buffer.from(b)))
+            const u8s = parts.map((b) => new Uint8Array(b))
+            buf = Buffer.concat(u8s)
           } else {
             // Fallback
             buf = Buffer.from(String(data ?? ""))
