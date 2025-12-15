@@ -7,6 +7,9 @@ import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs"
 import os from "os"
 import crypto from "crypto"
+import path from "path"
+import multer from "multer"
+import sharp from "sharp"
 
 export class Server {
   /** @type WebSocketServer */
@@ -131,13 +134,223 @@ export class Server {
 
     // Simple auth helper for HTTP endpoints (cookie-based)
     /** @param {import('express').Request} req @param {import('express').Response} res @param {import('express').NextFunction} next */
-    const requireAuth = (req, res, next) => {
+    const requireAuth = /** @type {any} */ ((req, res, next) => {
       if (!AUTH_TOKEN) return next()
       const cookies = parseCookies(req.headers.cookie || "")
       const token = cookies[COOKIE_NAME] || ""
       if (token === AUTH_TOKEN) return next()
       res.status(401).send("Unauthorized")
+    })
+
+    // --- Media storage + import ---
+    const MEDIA_DIR = path.join(this.#dataDir, "media")
+    try {
+      fs.mkdirSync(MEDIA_DIR, { recursive: true })
+    } catch {}
+
+    // Serve media as static files
+    app.use("/media", express.static(MEDIA_DIR))
+
+    const upload = multer({ storage: multer.memoryStorage() })
+    const isLikelyImageName = (name = "") => {
+      const n = String(name).toLowerCase()
+      return (
+        n.endsWith(".png") ||
+        n.endsWith(".jpg") ||
+        n.endsWith(".jpeg") ||
+        n.endsWith(".gif") ||
+        n.endsWith(".bmp") ||
+        n.endsWith(".webp") ||
+        n.endsWith(".tif") ||
+        n.endsWith(".tiff")
+      )
     }
+    const basenameAny = (p = "") => {
+      const s = String(p)
+      const parts = s.split(/[\\/]/g)
+      return parts[parts.length - 1] || s
+    }
+
+    ;/** @type {any} */ (app.post)("/assets", requireAuth, upload.single("asset"), async (req, res) => {
+      try {
+        /** @type {any} */
+        const reqAny = req
+        const file = reqAny.file || null
+        if (!file || !file.buffer) {
+          res.status(400).json({ ok: false, error: "missing_asset" })
+          return
+        }
+        const name = String(file.originalname || "")
+        if (!isLikelyImageName(name)) {
+          res.status(400).json({ ok: false, error: "not_an_image" })
+          return
+        }
+
+        const buf = file.buffer
+        const sha = crypto.createHash("sha256").update(buf).digest("hex")
+        const dir = path.join(MEDIA_DIR, sha)
+        try {
+          fs.mkdirSync(dir, { recursive: true })
+        } catch {}
+
+        const LODS = [256, 512, 1024, 2048]
+
+        const fullPath = path.join(dir, "full.webp")
+        if (!fs.existsSync(fullPath)) {
+          await sharp(buf).rotate().webp({ quality: 82 }).toFile(fullPath)
+        }
+
+        for (const s of LODS) {
+          const outPath = path.join(dir, `${s}.webp`)
+          if (fs.existsSync(outPath)) continue
+          await sharp(buf)
+            .rotate()
+            .resize({ width: s, height: s, fit: "inside", withoutEnlargement: true })
+            .webp({ quality: 78 })
+            .toFile(outPath)
+        }
+
+        let width = null
+        let height = null
+        try {
+          const meta = await sharp(buf).rotate().metadata()
+          width = typeof meta.width === "number" ? meta.width : null
+          height = typeof meta.height === "number" ? meta.height : null
+        } catch {}
+
+        res.json({
+          ok: true,
+          mediaId: sha,
+          url: `/media/${sha}/full.webp`,
+          urls: {
+            full: `/media/${sha}/full.webp`,
+            "2048": `/media/${sha}/2048.webp`,
+            "1024": `/media/${sha}/1024.webp`,
+            "512": `/media/${sha}/512.webp`,
+            "256": `/media/${sha}/256.webp`,
+          },
+          width,
+          height,
+        })
+      } catch (e) {
+        console.error("/assets failed", e)
+        res.status(500).json({ ok: false, error: "asset_upload_failed" })
+      }
+    })
+
+    // POST /import/canvas
+    // multipart fields:
+    //  - canvas: .canvas JSON file
+    //  - assets: image files (multiple)
+    app.post(
+      "/import/canvas",
+      requireAuth,
+      upload.fields([
+        { name: "canvas", maxCount: 1 },
+        { name: "assets", maxCount: 500 },
+      ]),
+      async (req, res) => {
+        try {
+          /** @type {any} */
+          const reqAny = req
+          /** @type {any} */
+          const files = reqAny.files || {}
+          const canvasFile = (files.canvas && files.canvas[0]) || null
+          const assets = Array.isArray(files.assets) ? files.assets : []
+          if (!canvasFile || !canvasFile.buffer) {
+            res.status(400).json({ ok: false, error: "missing_canvas" })
+            return
+          }
+
+          let canvasJson
+          try {
+            canvasJson = JSON.parse(String(canvasFile.buffer))
+          } catch {
+            res.status(400).json({ ok: false, error: "invalid_canvas_json" })
+            return
+          }
+
+          const nodes = Array.isArray(canvasJson.nodes) ? canvasJson.nodes : []
+
+          /** @type {Map<string, any>} */
+          const assetsByBase = new Map()
+          for (const f of assets) {
+            try {
+              const base = basenameAny(f.originalname || "")
+              if (!base) continue
+              assetsByBase.set(base, f)
+            } catch {}
+          }
+
+          /** @type {Record<string, { mediaId: string, url: string }>} */
+          const rewritten = {}
+          /** @type {string[]} */
+          const missing = []
+
+          const LODS = [256, 512, 1024, 2048]
+
+          /** @param {{ buffer?: Buffer } & any} file */
+          const ensureVariantsFor = async (file) => {
+            const buf = file && file.buffer ? file.buffer : null
+            if (!buf) throw new Error("missing_asset_buffer")
+
+            const sha = crypto.createHash("sha256").update(buf).digest("hex")
+            const dir = path.join(MEDIA_DIR, sha)
+            try {
+              fs.mkdirSync(dir, { recursive: true })
+            } catch {}
+
+            // Always write a full.webp (original dimensions, just normalized + webp)
+            const fullPath = path.join(dir, "full.webp")
+            if (!fs.existsSync(fullPath)) {
+              await sharp(buf).rotate().webp({ quality: 82 }).toFile(fullPath)
+            }
+
+            // Write LODs (bounded by requested size; no enlargement)
+            for (const s of LODS) {
+              const outPath = path.join(dir, `${s}.webp`)
+              if (fs.existsSync(outPath)) continue
+              await sharp(buf)
+                .rotate()
+                .resize({ width: s, height: s, fit: "inside", withoutEnlargement: true })
+                .webp({ quality: 78 })
+                .toFile(outPath)
+            }
+            return sha
+          }
+
+          for (const n of nodes) {
+            try {
+              const raw = typeof n?.file === "string" ? n.file : typeof n?.src === "string" ? n.src : ""
+              if (!raw) continue
+              const base = basenameAny(raw)
+              if (!isLikelyImageName(base)) continue
+
+              const asset = assetsByBase.get(base)
+              if (!asset) {
+                missing.push(base)
+                continue
+              }
+
+              if (!rewritten[base]) {
+                const mediaId = await ensureVariantsFor(asset)
+                rewritten[base] = { mediaId, url: `/media/${mediaId}/full.webp` }
+              }
+
+              const { mediaId, url } = rewritten[base]
+              // Obsidian canvas uses `file` for image nodes. Keep compatibility.
+              n.file = url
+              n.mediaId = mediaId
+            } catch {}
+          }
+
+          res.json({ ok: true, canvas: canvasJson, missing, assets: rewritten })
+        } catch (e) {
+          console.error("/import/canvas failed", e)
+          res.status(500).json({ ok: false, error: "import_failed" })
+        }
+      }
+    )
 
     // --- ACL helpers (per-document write protection) ---
     /**
